@@ -1,7 +1,6 @@
 {
-    "workbench.editor.showTabs": true,
-    "workbench.statusBar.visible": true,
-    "windhawk.editedModId": "new-mod",
-    "windhawk.editedModWasModified": false,
-    "git.enabled": true
+    "workbench.editor.showTabs": false,
+    "workbench.statusBar.visible": false,
+    "workbench.activityBar.location": "hidden",
+    "workbench.activityBar.visible": false
 }
