@@ -1,0 +1,25 @@
+c:\ProgramData\Windhawk\EditorWorkspace\mod.wh.cpp:2137:24: warning: 'Wh_SetFunctionHookT<void (void *)>' is deprecated: Use WindhawkUtils::SetFunctionHook() instead. [-Wdeprecated-declarations]
+ 2137 |         WindhawkUtils::Wh_SetFunctionHookT(
+      |                        ^
+C:/Program Files/Windhawk/Compiler/include/windhawk_utils.h:168:3: note: 'Wh_SetFunctionHookT<void (void *)>' has been explicitly marked deprecated here
+  168 | [[deprecated("Use WindhawkUtils::SetFunctionHook() instead.")]]
+      |   ^
+c:\ProgramData\Windhawk\EditorWorkspace\mod.wh.cpp:2329:24: warning: 'Wh_SetFunctionHookT<HINSTANCE__ *(const wchar_t *, void *, unsigned long)>' is deprecated: Use WindhawkUtils::SetFunctionHook() instead. [-Wdeprecated-declarations]
+ 2329 |         WindhawkUtils::Wh_SetFunctionHookT(pKernelBaseLoadLibraryExW,
+      |                        ^
+C:/Program Files/Windhawk/Compiler/include/windhawk_utils.h:168:3: note: 'Wh_SetFunctionHookT<HINSTANCE__ *(const wchar_t *, void *, unsigned long)>' has been explicitly marked deprecated here
+  168 | [[deprecated("Use WindhawkUtils::SetFunctionHook() instead.")]]
+      |   ^
+c:\ProgramData\Windhawk\EditorWorkspace\mod.wh.cpp:2334:20: warning: 'Wh_SetFunctionHookT<unsigned long long (unsigned long, _AppBarData *)>' is deprecated: Use WindhawkUtils::SetFunctionHook() instead. [-Wdeprecated-declarations]
+ 2334 |     WindhawkUtils::Wh_SetFunctionHookT(SHAppBarMessage, SHAppBarMessage_Hook,
+      |                    ^
+C:/Program Files/Windhawk/Compiler/include/windhawk_utils.h:168:3: note: 'Wh_SetFunctionHookT<unsigned long long (unsigned long, _AppBarData *)>' has been explicitly marked deprecated here
+  168 | [[deprecated("Use WindhawkUtils::SetFunctionHook() instead.")]]
+      |   ^
+c:\ProgramData\Windhawk\EditorWorkspace\mod.wh.cpp:2337:20: warning: 'Wh_SetFunctionHookT<long long (HWND__ *, unsigned int, unsigned long long, long long, unsigned int, unsigned int, unsigned long long *)>' is deprecated: Use WindhawkUtils::SetFunctionHook() instead. [-Wdeprecated-declarations]
+ 2337 |     WindhawkUtils::Wh_SetFunctionHookT(SendMessageTimeoutW,
+      |                    ^
+C:/Program Files/Windhawk/Compiler/include/windhawk_utils.h:168:3: note: 'Wh_SetFunctionHookT<long long (HWND__ *, unsigned int, unsigned long long, long long, unsigned int, unsigned int, unsigned long long *)>' has been explicitly marked deprecated here
+  168 | [[deprecated("Use WindhawkUtils::SetFunctionHook() instead.")]]
+      |   ^
+4 warnings generated.
