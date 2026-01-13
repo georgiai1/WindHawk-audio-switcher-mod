@@ -3,8 +3,9 @@
 // @name            Audio Output Device Switcher
 // @description     Ctrl+Scroll on the taskbar to switch audio output devices
 // @version         1.0
-// @author          You
-// @github          https://github.com/you
+// @author          Georgi AI
+// @github          https://github.com/georgiai1
+// @twitter         https://x.com/georgi_ai_
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32 -lgdi32 -ldwmapi
@@ -15,14 +16,26 @@
 /*
 # Audio Output Device Switcher
 
-Switch between audio output devices by holding **Ctrl** and scrolling the mouse
-wheel over the taskbar.
+Quickly switch between audio output devices by holding **Ctrl** and scrolling
+the mouse wheel over the taskbar.
 
-## Usage
-1. Compile the mod (Ctrl+B)
-2. Enable the mod
-3. Hold Ctrl and scroll over the taskbar to switch audio devices
-4. A popup shows which device is now active
+## How to use
+
+1. Hold **Ctrl** and scroll up/down over the taskbar
+2. Your audio output device will switch to the next/previous device
+3. A notification popup shows the newly selected device
+
+## Features
+
+- Works on Windows 10 and Windows 11
+- Supports multiple monitors (works on all taskbars)
+- Modern Windows 11-style notification popup
+- Configurable notification duration
+
+## Settings
+
+- **Show notification**: Enable/disable the popup notification
+- **Notification duration**: How long the popup stays visible (in milliseconds)
 */
 // ==/WindhawkModReadme==
 
@@ -31,7 +44,7 @@ wheel over the taskbar.
 - showNotification: true
   $name: Show notification
   $description: Show a popup notification when switching devices
-- notificationDuration: 800
+- notificationDuration: 1000
   $name: Notification duration (ms)
   $description: How long to show the notification (in milliseconds)
 */
@@ -214,11 +227,36 @@ bool SetDefaultAudioDevice(const std::wstring& deviceId) {
 }
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Strips text in parentheses from device name
+// e.g., "Speakers (Realtek Audio)" -> "Speakers"
+std::wstring StripParentheses(const std::wstring& name) {
+    std::wstring result;
+    int depth = 0;
+    for (size_t i = 0; i < name.length(); i++) {
+        if (name[i] == L'(') {
+            depth++;
+        } else if (name[i] == L')') {
+            depth--;
+        } else if (depth == 0) {
+            result += name[i];
+        }
+    }
+    // Trim trailing whitespace
+    while (!result.empty() && result.back() == L' ') {
+        result.pop_back();
+    }
+    return result;
+}
+
+// ============================================================================
 // Notification Popup - Windows 11 Style
 // ============================================================================
 
 // Popup dimensions
-const int POPUP_WIDTH = 400;
+const int POPUP_WIDTH = 300;
 const int POPUP_HEIGHT = 60;
 const int POPUP_CORNER_RADIUS = 12;
 const int POPUP_MARGIN = 20;
@@ -358,8 +396,8 @@ void ShowNotification(const std::wstring& deviceName) {
         g_popupWnd = nullptr;
     }
 
-    // Store just the device name (we add the label in paint)
-    g_popupText = deviceName;
+    // Store device name with parenthetical text stripped
+    g_popupText = StripParentheses(deviceName);
 
     // Get work area (excludes taskbar)
     RECT workArea;
@@ -734,7 +772,7 @@ void LoadSettings() {
     g_settings.showNotification = Wh_GetIntSetting(L"showNotification");
     g_settings.notificationDuration = Wh_GetIntSetting(L"notificationDuration");
     if (g_settings.notificationDuration <= 0) {
-        g_settings.notificationDuration = 800;
+        g_settings.notificationDuration = 1000;
     }
     Wh_Log(L"Settings: showNotification=%d, duration=%d",
            g_settings.showNotification, g_settings.notificationDuration);
