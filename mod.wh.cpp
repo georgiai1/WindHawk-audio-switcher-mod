@@ -7,7 +7,7 @@
 // @github          https://github.com/you
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32 -lgdi32
+// @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32 -lgdi32 -ldwmapi
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -31,7 +31,7 @@ wheel over the taskbar.
 - showNotification: true
   $name: Show notification
   $description: Show a popup notification when switching devices
-- notificationDuration: 1500
+- notificationDuration: 800
   $name: Notification duration (ms)
   $description: How long to show the notification (in milliseconds)
 */
@@ -41,11 +41,17 @@ wheel over the taskbar.
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>
 #include <vector>
 #include <string>
 #include <unordered_set>
+
+// DWM constants for Windows 11 effects (in case not defined)
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 
 // PKEY_Device_FriendlyName
 static const PROPERTYKEY PKEY_Device_FriendlyName = {
@@ -208,52 +214,116 @@ bool SetDefaultAudioDevice(const std::wstring& deviceId) {
 }
 
 // ============================================================================
-// Notification Popup
+// Notification Popup - Windows 11 Style
 // ============================================================================
+
+// Popup dimensions
+const int POPUP_WIDTH = 400;
+const int POPUP_HEIGHT = 60;
+const int POPUP_CORNER_RADIUS = 12;
+const int POPUP_MARGIN = 20;
+
+// Colors (Windows 11 dark theme style)
+const COLORREF COLOR_BG = RGB(32, 32, 32);
+const COLORREF COLOR_BG_ACCENT = RGB(45, 45, 45);
+const COLORREF COLOR_BORDER = RGB(60, 60, 60);
+const COLORREF COLOR_TEXT_PRIMARY = RGB(255, 255, 255);
+
+void DrawRoundedRect(HDC hdc, RECT* rc, int radius, COLORREF fillColor, COLORREF borderColor) {
+    HBRUSH brush = CreateSolidBrush(fillColor);
+    HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+
+    RoundRect(hdc, rc->left, rc->top, rc->right, rc->bottom, radius * 2, radius * 2);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
 
 LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_CREATE: {
+            // Enable Windows 11 rounded corners
+            DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+
+            // Enable dark mode
+            BOOL darkMode = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
+
+            // Try to enable Mica/Acrylic backdrop (Windows 11)
+            DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_TRANSIENTWINDOW;
+            DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+
+            return 0;
+        }
+
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
+
+            // Get dimensions
             RECT rc;
             GetClientRect(hwnd, &rc);
 
-            // Dark background
-            HBRUSH bgBrush = CreateSolidBrush(RGB(30, 30, 30));
-            FillRect(hdc, &rc, bgBrush);
+            // Create memory DC for double buffering
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+            // Fill background with dark color
+            HBRUSH bgBrush = CreateSolidBrush(COLOR_BG);
+            FillRect(memDC, &rc, bgBrush);
             DeleteObject(bgBrush);
 
-            // Border
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
-            HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-            HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, 0, 0, rc.right, rc.bottom);
-            SelectObject(hdc, oldPen);
-            SelectObject(hdc, oldBrush);
-            DeleteObject(pen);
+            // Draw subtle inner highlight/border
+            RECT innerRect = { 1, 1, rc.right - 1, rc.bottom - 1 };
+            DrawRoundedRect(memDC, &innerRect, POPUP_CORNER_RADIUS - 1, COLOR_BG_ACCENT, COLOR_BORDER);
 
-            // Text
-            SetTextColor(hdc, RGB(255, 255, 255));
-            SetBkMode(hdc, TRANSPARENT);
+            // Setup text rendering
+            SetBkMode(memDC, TRANSPARENT);
+            SetTextColor(memDC, COLOR_TEXT_PRIMARY);
 
-            HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            // Draw device name (large, centered)
+            HFONT nameFont = CreateFontW(28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
+            HFONT oldFont = (HFONT)SelectObject(memDC, nameFont);
 
-            DrawTextW(hdc, g_popupText.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            RECT textRect = rc;
+            DrawTextW(memDC, g_popupText.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-            SelectObject(hdc, oldFont);
-            DeleteObject(hFont);
+            SelectObject(memDC, oldFont);
+            DeleteObject(nameFont);
+
+            // Copy to screen
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+
+            // Cleanup
+            SelectObject(memDC, oldBitmap);
+            DeleteObject(memBitmap);
+            DeleteDC(memDC);
+
             EndPaint(hwnd, &ps);
             return 0;
         }
+
         case WM_TIMER:
             KillTimer(hwnd, 1);
+            // Quick fade out
+            for (int alpha = 230; alpha >= 0; alpha -= 40) {
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+                Sleep(8);
+            }
             DestroyWindow(hwnd);
             g_popupWnd = nullptr;
             return 0;
+
+        case WM_NCHITTEST:
+            return HTCLIENT;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -267,6 +337,7 @@ void RegisterPopupClass() {
     wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = POPUP_CLASS_NAME;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr; // We handle painting ourselves
 
     if (RegisterClassExW(&wc)) {
         g_popupClassRegistered = true;
@@ -282,32 +353,42 @@ void ShowNotification(const std::wstring& deviceName) {
     RegisterPopupClass();
 
     if (g_popupWnd) {
+        KillTimer(g_popupWnd, 1);
         DestroyWindow(g_popupWnd);
         g_popupWnd = nullptr;
     }
 
-    g_popupText = L"Audio: " + deviceName;
+    // Store just the device name (we add the label in paint)
+    g_popupText = deviceName;
 
     // Get work area (excludes taskbar)
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
 
-    int popupWidth = 350;
-    int popupHeight = 45;
-    int x = (workArea.right - workArea.left - popupWidth) / 2 + workArea.left;
-    int y = workArea.bottom - popupHeight - 10;
+    // Center horizontally, position near bottom
+    int x = (workArea.right - workArea.left - POPUP_WIDTH) / 2 + workArea.left;
+    int y = workArea.bottom - POPUP_HEIGHT - 50;
 
     g_popupWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         POPUP_CLASS_NAME, L"", WS_POPUP,
-        x, y, popupWidth, popupHeight,
+        x, y, POPUP_WIDTH, POPUP_HEIGHT,
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
 
     if (g_popupWnd) {
-        SetLayeredWindowAttributes(g_popupWnd, 0, 230, LWA_ALPHA);
+        // Set initial transparency
+        SetLayeredWindowAttributes(g_popupWnd, 0, 0, LWA_ALPHA);
         ShowWindow(g_popupWnd, SW_SHOWNOACTIVATE);
         UpdateWindow(g_popupWnd);
+
+        // Quick fade in
+        for (int alpha = 0; alpha <= 230; alpha += 50) {
+            SetLayeredWindowAttributes(g_popupWnd, 0, alpha, LWA_ALPHA);
+            Sleep(5);
+        }
+        SetLayeredWindowAttributes(g_popupWnd, 0, 230, LWA_ALPHA);
+
         SetTimer(g_popupWnd, 1, g_settings.notificationDuration, nullptr);
         Wh_Log(L"Notification shown");
     } else {
@@ -653,7 +734,7 @@ void LoadSettings() {
     g_settings.showNotification = Wh_GetIntSetting(L"showNotification");
     g_settings.notificationDuration = Wh_GetIntSetting(L"notificationDuration");
     if (g_settings.notificationDuration <= 0) {
-        g_settings.notificationDuration = 1500;
+        g_settings.notificationDuration = 800;
     }
     Wh_Log(L"Settings: showNotification=%d, duration=%d",
            g_settings.showNotification, g_settings.notificationDuration);
