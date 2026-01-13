@@ -1,5 +1,9 @@
 {
-    "workbench.editor.showTabs": "single",
-    "workbench.statusBar.visible": false,
-    "workbench.activityBar.location": "hidden"
+    "workbench.editor.showTabs": true,
+    "workbench.statusBar.visible": true,
+    "workbench.activityBar.location": "hidden",
+    "workbench.activityBar.visible": false,
+    "windhawk.editedModId": "audio-scroll-switcher",
+    "windhawk.editedModWasModified": false,
+    "git.enabled": true
 }

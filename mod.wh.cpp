@@ -7,7 +7,7 @@
 // @github          https://github.com/you
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32
+// @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32 -lgdi32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -39,6 +39,7 @@ wheel over the taskbar.
 
 #include <windhawk_utils.h>
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>
