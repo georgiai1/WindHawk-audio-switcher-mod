@@ -113,6 +113,13 @@ HWND g_popupWnd = nullptr;
 std::wstring g_popupText;
 const wchar_t* POPUP_CLASS_NAME = L"AudioSwitcherPopup_WH";
 bool g_popupClassRegistered = false;
+const UINT_PTR TIMER_FIND_INPUTSITE = 1001;
+int g_inputSiteRetryCount = 0;
+const int MAX_INPUTSITE_RETRIES = 30;  // 30 retries * 500ms = 15 seconds
+bool g_inputSiteProcHooked = false;
+
+// Forward declaration
+void HandleIdentifiedInputSiteWindow(HWND hWnd);
 
 UINT g_subclassRegisteredMsg = RegisterWindowMessage(
     L"Windhawk_SetWindowSubclassFromAnyThread_audio-scroll-switcher");
@@ -527,6 +534,41 @@ LRESULT CALLBACK TaskbarWindowSubclassProc(
             }
             break;
 
+        case WM_TIMER:
+            if (wParam == TIMER_FIND_INPUTSITE) {
+                g_inputSiteRetryCount++;
+                Wh_Log(L"InputSite retry attempt %d/%d", g_inputSiteRetryCount, MAX_INPUTSITE_RETRIES);
+
+                if (!g_inputSiteProcHooked && g_hTaskbarWnd) {
+                    HWND hXamlIslandWnd = FindWindowEx(
+                        g_hTaskbarWnd, nullptr,
+                        L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
+                    if (hXamlIslandWnd) {
+                        Wh_Log(L"Found DesktopWindowContentBridge: %p", hXamlIslandWnd);
+                        HWND hInputSiteWnd = FindWindowEx(
+                            hXamlIslandWnd, nullptr,
+                            L"Windows.UI.Input.InputSite.WindowClass", nullptr);
+                        if (hInputSiteWnd) {
+                            Wh_Log(L"Found InputSite: %p", hInputSiteWnd);
+                            HandleIdentifiedInputSiteWindow(hInputSiteWnd);
+                            if (g_inputSiteProcHooked) {
+                                KillTimer(hWnd, TIMER_FIND_INPUTSITE);
+                                Wh_Log(L"InputSite hooked via retry timer after %d attempts", g_inputSiteRetryCount);
+                            }
+                        }
+                    }
+                }
+
+                if (g_inputSiteProcHooked || g_inputSiteRetryCount >= MAX_INPUTSITE_RETRIES) {
+                    KillTimer(hWnd, TIMER_FIND_INPUTSITE);
+                    if (!g_inputSiteProcHooked) {
+                        Wh_Log(L"InputSite hook failed after %d retries - Windows 10 or scroll won't work", g_inputSiteRetryCount);
+                    }
+                }
+                return 0;
+            }
+            break;
+
         case WM_NCDESTROY:
             if (hWnd != g_hTaskbarWnd) {
                 g_secondaryTaskbarWindows.erase(hWnd);
@@ -615,8 +657,6 @@ void SubclassTaskbarWindow(HWND hWnd) {
 void UnsubclassTaskbarWindow(HWND hWnd) {
     SendMessage(hWnd, g_subclassRegisteredMsg, FALSE, 0);
 }
-
-bool g_inputSiteProcHooked = false;
 
 void HandleIdentifiedInputSiteWindow(HWND hWnd) {
     if (!g_dwTaskbarThreadId || GetWindowThreadProcessId(hWnd, nullptr) != g_dwTaskbarThreadId) {
@@ -814,6 +854,13 @@ void Wh_ModAfterInit() {
         }
     }
 
+    // If InputSite not hooked yet, set a timer to retry (Windows 11 XAML may load late)
+    if (g_hTaskbarWnd && !g_inputSiteProcHooked) {
+        Wh_Log(L"InputSite not hooked yet, starting retry timer (500ms intervals, up to 15 seconds)...");
+        g_inputSiteRetryCount = 0;
+        SetTimer(g_hTaskbarWnd, TIMER_FIND_INPUTSITE, 500, nullptr);
+    }
+
     Wh_Log(L"=== Ready! Hold Ctrl and scroll over the taskbar to switch audio devices ===");
 }
 
@@ -821,6 +868,7 @@ void Wh_ModUninit() {
     Wh_Log(L"=== Audio Output Device Switcher uninitializing ===");
 
     if (g_hTaskbarWnd) {
+        KillTimer(g_hTaskbarWnd, TIMER_FIND_INPUTSITE);
         UnsubclassTaskbarWindow(g_hTaskbarWnd);
         for (HWND hSecondaryWnd : g_secondaryTaskbarWindows) {
             UnsubclassTaskbarWindow(hSecondaryWnd);
