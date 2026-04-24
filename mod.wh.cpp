@@ -125,6 +125,17 @@ DWORD g_lastScrollTime = 0;
 short g_lastScrollRemainder = 0;
 HWND g_lastScrollTarget = nullptr;
 
+// Returns this mod's DLL HINSTANCE. GetModuleHandle(nullptr) would return
+// explorer.exe, which is wrong for RegisterClass/CreateWindowEx/UnregisterClass.
+HINSTANCE GetCurrentModuleHandle() {
+    HINSTANCE hInst = nullptr;
+    GetModuleHandleEx(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)&GetCurrentModuleHandle, &hInst);
+    return hInst;
+}
+
 // Forward declarations
 void HandleIdentifiedInputSiteWindow(HWND hWnd);
 void HandleIdentifiedTaskbarWindow(HWND hWnd);
@@ -142,7 +153,24 @@ struct AudioDevice {
 // Audio Device Functions
 // ============================================================================
 
+// RAII: initialize COM for the duration of the enclosing scope. Per-call
+// scoping avoids cross-thread CoInit/CoUninit pairing (Windhawk can run
+// Wh_ModInit / Wh_ModUninit on different threads).
+struct ComScope {
+    bool owned = false;
+    ComScope() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        owned = SUCCEEDED(hr);  // RPC_E_CHANGED_MODE -> thread already init'd; don't uninit
+    }
+    ~ComScope() {
+        if (owned) {
+            CoUninitialize();
+        }
+    }
+};
+
 std::vector<AudioDevice> GetAudioOutputDevices() {
+    ComScope com;
     std::vector<AudioDevice> devices;
     IMMDeviceEnumerator* pEnumerator = nullptr;
 
@@ -201,6 +229,7 @@ std::vector<AudioDevice> GetAudioOutputDevices() {
 }
 
 std::wstring GetDefaultDeviceId() {
+    ComScope com;
     std::wstring deviceId;
     IMMDeviceEnumerator* pEnumerator = nullptr;
 
@@ -223,6 +252,7 @@ std::wstring GetDefaultDeviceId() {
 }
 
 bool SetDefaultAudioDevice(const std::wstring& deviceId) {
+    ComScope com;
     IPolicyConfig* pPolicyConfig = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_CPolicyConfigClient, nullptr, CLSCTX_ALL,
         IID_IPolicyConfig, (void**)&pPolicyConfig);
@@ -474,7 +504,12 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 Sleep(8);
             }
             DestroyWindow(hwnd);
-            g_popupWnd = nullptr;
+            return 0;
+
+        case WM_DESTROY:
+            if (g_popupWnd == hwnd) {
+                g_popupWnd = nullptr;
+            }
             return 0;
 
         case WM_NCHITTEST:
@@ -489,7 +524,7 @@ void RegisterPopupClass() {
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = PopupWndProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hInstance = GetCurrentModuleHandle();
     wc.lpszClassName = POPUP_CLASS_NAME;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr; // We handle painting ourselves
@@ -528,7 +563,7 @@ void ShowNotification(const std::wstring& deviceName) {
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         POPUP_CLASS_NAME, L"", WS_POPUP,
         x, y, POPUP_WIDTH, POPUP_HEIGHT,
-        nullptr, nullptr, GetModuleHandle(nullptr), nullptr
+        nullptr, nullptr, GetCurrentModuleHandle(), nullptr
     );
 
     if (g_popupWnd) {
@@ -956,11 +991,7 @@ BOOL Wh_ModInit() {
     // Write startup marker FIRST - to verify mod is loading at all
     WriteStartupMarker();
 
-    // Initialize COM
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-        Wh_Log(L"Failed to initialize COM: 0x%08X", hr);
-    }
+    // COM is initialized per-call (see ComScope) so it works on any thread.
 
     LoadSettings();
 
@@ -1008,16 +1039,16 @@ void Wh_ModUninit() {
     }
 
     if (g_popupWnd) {
-        DestroyWindow(g_popupWnd);
+        // Cross-thread safe: WM_CLOSE is marshaled to the popup's owning
+        // (taskbar) thread, which then runs DestroyWindow locally.
+        SendMessageW(g_popupWnd, WM_CLOSE, 0, 0);
         g_popupWnd = nullptr;
     }
 
     if (g_popupClassRegistered) {
-        UnregisterClassW(POPUP_CLASS_NAME, GetModuleHandle(nullptr));
+        UnregisterClassW(POPUP_CLASS_NAME, GetCurrentModuleHandle());
         g_popupClassRegistered = false;
     }
-
-    CoUninitialize();
 }
 
 void Wh_ModSettingsChanged() {
