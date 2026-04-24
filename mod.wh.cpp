@@ -11,7 +11,7 @@
 // @compilerOptions -lole32 -loleaut32 -lpropsys -lcomctl32 -lgdi32 -ldwmapi
 // @license         MIT
 // ==/WindhawkMod==
-
+ 
 // ==WindhawkModReadme==
 /*
 # Audio Output Device Switcher
@@ -19,7 +19,7 @@
 Quickly switch between audio output devices by holding **Ctrl** and scrolling
 the mouse wheel over the taskbar.
 
-## How to use
+## How to use 
 
 1. Hold **Ctrl** and scroll up/down over the taskbar
 2. Your audio output device will switch to the next/previous device
@@ -115,11 +115,20 @@ const wchar_t* POPUP_CLASS_NAME = L"AudioSwitcherPopup_WH";
 bool g_popupClassRegistered = false;
 const UINT_PTR TIMER_FIND_INPUTSITE = 1001;
 int g_inputSiteRetryCount = 0;
-const int MAX_INPUTSITE_RETRIES = 30;  // 30 retries * 500ms = 15 seconds
+const int MAX_INPUTSITE_RETRIES = 30;
 bool g_inputSiteProcHooked = false;
 
-// Forward declaration
+// Wheel-delta accumulation state. Hi-res / smooth-scrolling mice split one
+// physical notch into many small-delta messages; accumulate until a full
+// WHEEL_DELTA is crossed before firing a switch. 5s window, per-target.
+DWORD g_lastScrollTime = 0;
+short g_lastScrollRemainder = 0;
+HWND g_lastScrollTarget = nullptr;
+
+// Forward declarations
 void HandleIdentifiedInputSiteWindow(HWND hWnd);
+void HandleIdentifiedTaskbarWindow(HWND hWnd);
+HWND FindCurrentProcessTaskbarWindows(std::unordered_set<HWND>* secondaryTaskbarWindows);
 
 UINT g_subclassRegisteredMsg = RegisterWindowMessage(
     L"Windhawk_SetWindowSubclassFromAnyThread_audio-scroll-switcher");
@@ -256,6 +265,107 @@ std::wstring StripParentheses(const std::wstring& name) {
         result.pop_back();
     }
     return result;
+}
+
+// ============================================================================
+// Startup Diagnostic
+// ============================================================================
+
+void WriteStartupMarker() {
+    WCHAR path[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, path)) {
+        wcscat_s(path, L"audio_switcher_loaded.txt");
+        HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            WCHAR buf[256];
+            wsprintfW(buf, L"Loaded at %02d:%02d:%02d on %04d-%02d-%02d",
+                st.wHour, st.wMinute, st.wSecond, st.wYear, st.wMonth, st.wDay);
+            DWORD written;
+            WriteFile(hFile, buf, (DWORD)(wcslen(buf) * sizeof(WCHAR)), &written, nullptr);
+            CloseHandle(hFile);
+            Wh_Log(L"Startup marker written to: %s", path);
+        }
+    }
+}
+
+// ============================================================================
+// Startup Retry Thread
+// ============================================================================
+
+HANDLE g_retryThread = nullptr;
+volatile bool g_stopRetryThread = false;
+
+DWORD WINAPI RetryThreadProc(LPVOID lpParam) {
+    Wh_Log(L"Retry thread started - retrying immediately every 500ms");
+
+    // NO initial delay - try immediately and every 500ms
+    for (int attempt = 1; attempt <= 60 && !g_stopRetryThread; attempt++) {
+        Wh_Log(L"Retry thread attempt %d/60", attempt);
+
+        if (!g_hTaskbarWnd) {
+            HWND hWnd = FindCurrentProcessTaskbarWindows(&g_secondaryTaskbarWindows);
+            if (hWnd) {
+                Wh_Log(L"Retry thread found taskbar: %p", hWnd);
+                HandleIdentifiedTaskbarWindow(hWnd);
+            }
+        }
+
+        // Check for InputSite if taskbar is found
+        if (g_hTaskbarWnd && !g_inputSiteProcHooked) {
+            HWND hXamlIslandWnd = FindWindowEx(
+                g_hTaskbarWnd, nullptr,
+                L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
+            if (hXamlIslandWnd) {
+                HWND hInputSiteWnd = FindWindowEx(
+                    hXamlIslandWnd, nullptr,
+                    L"Windows.UI.Input.InputSite.WindowClass", nullptr);
+                if (hInputSiteWnd) {
+                    Wh_Log(L"Retry thread found InputSite: %p", hInputSiteWnd);
+                    HandleIdentifiedInputSiteWindow(hInputSiteWnd);
+                }
+            }
+        }
+
+        // If both are hooked, we're done
+        if (g_hTaskbarWnd && g_inputSiteProcHooked) {
+            Wh_Log(L"Retry thread: all hooks installed successfully!");
+            break;
+        }
+
+        // Wait before next attempt
+        Sleep(500);
+    }
+
+    if (!g_hTaskbarWnd) {
+        Wh_Log(L"Retry thread: taskbar not found in this process after all attempts");
+    } else if (!g_inputSiteProcHooked) {
+        Wh_Log(L"Retry thread: InputSite not found (might be Windows 10)");
+    }
+
+    Wh_Log(L"Retry thread exiting");
+    return 0;
+}
+
+void StartRetryThread() {
+    g_stopRetryThread = false;
+    g_retryThread = CreateThread(nullptr, 0, RetryThreadProc, nullptr, 0, nullptr);
+    if (g_retryThread) {
+        Wh_Log(L"Started retry thread");
+    } else {
+        Wh_Log(L"Failed to start retry thread: %u", GetLastError());
+    }
+}
+
+void StopRetryThread() {
+    if (g_retryThread) {
+        g_stopRetryThread = true;
+        WaitForSingleObject(g_retryThread, 3000);
+        CloseHandle(g_retryThread);
+        g_retryThread = nullptr;
+    }
 }
 
 // ============================================================================
@@ -506,12 +616,32 @@ bool OnMouseWheel(HWND hWnd, WPARAM wParam, LPARAM lParam) {
         return false;
     }
 
-    int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-    int direction = (delta > 0) ? -1 : 1;  // Up = previous, Down = next
+    // Accumulate raw delta: hi-res/smooth-scroll mice emit many sub-notch
+    // messages per physical click. Carry the leftover within a 5s window
+    // for the same target, then only fire once per full WHEEL_DELTA crossed.
+    short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+    DWORD now = GetTickCount();
+    if (g_lastScrollTarget == hWnd && now - g_lastScrollTime < 5000) {
+        delta = (short)(delta + g_lastScrollRemainder);
+    }
+    int clicks = delta / WHEEL_DELTA;
+    g_lastScrollRemainder = (short)(delta % WHEEL_DELTA);
+    g_lastScrollTime = now;
+    g_lastScrollTarget = hWnd;
 
-    Wh_Log(L"Ctrl+Scroll detected! delta=%d, direction=%d", delta, direction);
+    if (clicks == 0) {
+        Wh_Log(L"Ctrl+Scroll accumulating: carry=%d", g_lastScrollRemainder);
+        return true;  // consume so the page doesn't side-scroll
+    }
 
-    SwitchAudioDevice(direction);
+    int direction = (clicks > 0) ? -1 : 1;  // Up = previous, Down = next
+    int steps = (clicks > 0) ? clicks : -clicks;
+
+    Wh_Log(L"Ctrl+Scroll fired! delta=%d clicks=%d direction=%d", delta, clicks, direction);
+
+    for (int i = 0; i < steps; i++) {
+        SwitchAudioDevice(direction);
+    }
     return true;
 }
 
@@ -529,7 +659,9 @@ LRESULT CALLBACK TaskbarWindowSubclassProc(
 
     switch (uMsg) {
         case WM_MOUSEWHEEL:
-            if (OnMouseWheel(hWnd, wParam, lParam)) {
+            // On Win11 the XAML InputSite delivers WM_POINTERWHEEL separately;
+            // if that hook is active, skip this path to avoid double-firing.
+            if (!g_inputSiteProcHooked && OnMouseWheel(hWnd, wParam, lParam)) {
                 return 0;  // Consume the message
             }
             break;
@@ -821,6 +953,9 @@ void LoadSettings() {
 BOOL Wh_ModInit() {
     Wh_Log(L"=== Audio Output Device Switcher initializing ===");
 
+    // Write startup marker FIRST - to verify mod is loading at all
+    WriteStartupMarker();
+
     // Initialize COM
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -843,29 +978,26 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L"Wh_ModAfterInit - looking for existing taskbar windows...");
 
-    // Find existing taskbar windows
-    WNDCLASS wndclass;
-    if (GetClassInfo(GetModuleHandle(nullptr), L"Shell_TrayWnd", &wndclass)) {
-        HWND hWnd = FindCurrentProcessTaskbarWindows(&g_secondaryTaskbarWindows);
-        if (hWnd) {
-            HandleIdentifiedTaskbarWindow(hWnd);
-        } else {
-            Wh_Log(L"No taskbar window found yet");
-        }
+    // Try to find existing taskbar windows immediately
+    HWND hWnd = FindCurrentProcessTaskbarWindows(&g_secondaryTaskbarWindows);
+    if (hWnd) {
+        HandleIdentifiedTaskbarWindow(hWnd);
+    } else {
+        Wh_Log(L"No taskbar window found yet");
     }
 
-    // If InputSite not hooked yet, set a timer to retry (Windows 11 XAML may load late)
-    if (g_hTaskbarWnd && !g_inputSiteProcHooked) {
-        Wh_Log(L"InputSite not hooked yet, starting retry timer (500ms intervals, up to 15 seconds)...");
-        g_inputSiteRetryCount = 0;
-        SetTimer(g_hTaskbarWnd, TIMER_FIND_INPUTSITE, 500, nullptr);
-    }
+    // Always start retry thread - it will handle finding taskbar and InputSite
+    // even if taskbar was found, InputSite might not be ready yet
+    StartRetryThread();
 
     Wh_Log(L"=== Ready! Hold Ctrl and scroll over the taskbar to switch audio devices ===");
 }
 
 void Wh_ModUninit() {
     Wh_Log(L"=== Audio Output Device Switcher uninitializing ===");
+
+    // Stop retry thread first
+    StopRetryThread();
 
     if (g_hTaskbarWnd) {
         KillTimer(g_hTaskbarWnd, TIMER_FIND_INPUTSITE);
