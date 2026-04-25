@@ -133,14 +133,6 @@ HINSTANCE GetCurrentModuleHandle() {
     return hInst;
 }
 
-// Forward declarations
-void HandleIdentifiedInputSiteWindow(HWND hWnd);
-void HandleIdentifiedTaskbarWindow(HWND hWnd);
-HWND FindCurrentProcessTaskbarWindows(std::unordered_set<HWND>* secondaryTaskbarWindows);
-
-UINT g_subclassRegisteredMsg = RegisterWindowMessage(
-    L"Windhawk_SetWindowSubclassFromAnyThread_audio-scroll-switcher");
-
 struct AudioDevice {
     std::wstring id;
     std::wstring name;
@@ -295,30 +287,6 @@ std::wstring StripParentheses(const std::wstring& name) {
 }
 
 // ============================================================================
-// Startup Diagnostic
-// ============================================================================
-
-void WriteStartupMarker() {
-    WCHAR path[MAX_PATH];
-    if (GetTempPathW(MAX_PATH, path)) {
-        wcscat_s(path, L"audio_switcher_loaded.txt");
-        HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            WCHAR buf[256];
-            wsprintfW(buf, L"Loaded at %02d:%02d:%02d on %04d-%02d-%02d",
-                st.wHour, st.wMinute, st.wSecond, st.wYear, st.wMonth, st.wDay);
-            DWORD written;
-            WriteFile(hFile, buf, (DWORD)(wcslen(buf) * sizeof(WCHAR)), &written, nullptr);
-            CloseHandle(hFile);
-            Wh_Log(L"Startup marker written to: %s", path);
-        }
-    }
-}
-
-// ============================================================================
 // Notification Popup - Windows 11 Style
 // ============================================================================
 
@@ -367,10 +335,6 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Enable dark mode
             BOOL darkMode = TRUE;
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
-
-            // Try to enable Mica/Acrylic backdrop (Windows 11)
-            DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_TRANSIENTWINDOW;
-            DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
 
             return 0;
         }
@@ -618,18 +582,16 @@ bool OnMouseWheel(HWND hWnd, WPARAM wParam, LPARAM lParam) {
     return true;
 }
 
+// WindhawkUtils::SetWindowSubclassFromAnyThread wraps this and handles
+// WM_NCDESTROY / unsubclass-message routing internally — no manual cleanup
+// needed in the proc body.
 LRESULT CALLBACK TaskbarWindowSubclassProc(
     HWND hWnd,
     UINT uMsg,
     WPARAM wParam,
     LPARAM lParam,
-    UINT_PTR uIdSubclass,
     DWORD_PTR dwRefData
 ) {
-    if (uMsg == WM_NCDESTROY || (uMsg == g_subclassRegisteredMsg && !wParam)) {
-        RemoveWindowSubclass(hWnd, TaskbarWindowSubclassProc, 0);
-    }
-
     switch (uMsg) {
         case WM_MOUSEWHEEL:
             // On Win11 the XAML InputSite delivers WM_POINTERWHEEL separately;
@@ -662,62 +624,8 @@ LRESULT CALLBACK InputSiteWindowProc_Hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
     return InputSiteWindowProc_Original(hWnd, uMsg, wParam, lParam);
 }
 
-BOOL SetWindowSubclassFromAnyThread(HWND hWnd, SUBCLASSPROC pfnSubclass, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    struct SET_WINDOW_SUBCLASS_PARAM {
-        SUBCLASSPROC pfnSubclass;
-        UINT_PTR uIdSubclass;
-        DWORD_PTR dwRefData;
-        BOOL result;
-    };
-
-    DWORD dwThreadId = GetWindowThreadProcessId(hWnd, nullptr);
-    if (dwThreadId == 0) {
-        return FALSE;
-    }
-
-    if (dwThreadId == GetCurrentThreadId()) {
-        return SetWindowSubclass(hWnd, pfnSubclass, uIdSubclass, dwRefData);
-    }
-
-    HHOOK hook = SetWindowsHookEx(
-        WH_CALLWNDPROC,
-        [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            if (nCode == HC_ACTION) {
-                const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
-                if (cwp->message == g_subclassRegisteredMsg && cwp->wParam) {
-                    auto* param = (SET_WINDOW_SUBCLASS_PARAM*)cwp->lParam;
-                    param->result = SetWindowSubclass(
-                        cwp->hwnd,
-                        param->pfnSubclass,
-                        param->uIdSubclass,
-                        param->dwRefData
-                    );
-                }
-            }
-            return CallNextHookEx(nullptr, nCode, wParam, lParam);
-        },
-        nullptr,
-        dwThreadId
-    );
-
-    if (!hook) {
-        return FALSE;
-    }
-
-    SET_WINDOW_SUBCLASS_PARAM param;
-    param.pfnSubclass = pfnSubclass;
-    param.uIdSubclass = uIdSubclass;
-    param.dwRefData = dwRefData;
-    param.result = FALSE;
-
-    SendMessage(hWnd, g_subclassRegisteredMsg, TRUE, (LPARAM)&param);
-    UnhookWindowsHookEx(hook);
-
-    return param.result;
-}
-
 void SubclassTaskbarWindow(HWND hWnd) {
-    if (SetWindowSubclassFromAnyThread(hWnd, TaskbarWindowSubclassProc, 0, 0)) {
+    if (WindhawkUtils::SetWindowSubclassFromAnyThread(hWnd, TaskbarWindowSubclassProc, 0)) {
         Wh_Log(L"Subclassed taskbar window: %p", hWnd);
     } else {
         Wh_Log(L"Failed to subclass taskbar window: %p", hWnd);
@@ -725,7 +633,7 @@ void SubclassTaskbarWindow(HWND hWnd) {
 }
 
 void UnsubclassTaskbarWindow(HWND hWnd) {
-    SendMessage(hWnd, g_subclassRegisteredMsg, FALSE, 0);
+    WindhawkUtils::RemoveWindowSubclassFromAnyThread(hWnd, TaskbarWindowSubclassProc);
 }
 
 void HandleIdentifiedInputSiteWindow(HWND hWnd) {
@@ -890,9 +798,6 @@ void LoadSettings() {
 
 BOOL Wh_ModInit() {
     Wh_Log(L"=== Audio Output Device Switcher initializing ===");
-
-    // Write startup marker FIRST - to verify mod is loading at all
-    WriteStartupMarker();
 
     // COM is initialized per-call (see ComScope) so it works on any thread.
 
