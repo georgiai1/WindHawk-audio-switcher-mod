@@ -113,9 +113,6 @@ HWND g_popupWnd = nullptr;
 std::wstring g_popupText;
 const wchar_t* POPUP_CLASS_NAME = L"AudioSwitcherPopup_WH";
 bool g_popupClassRegistered = false;
-const UINT_PTR TIMER_FIND_INPUTSITE = 1001;
-int g_inputSiteRetryCount = 0;
-const int MAX_INPUTSITE_RETRIES = 30;
 bool g_inputSiteProcHooked = false;
 
 // Wheel-delta accumulation state. Hi-res / smooth-scrolling mice split one
@@ -322,83 +319,6 @@ void WriteStartupMarker() {
 }
 
 // ============================================================================
-// Startup Retry Thread
-// ============================================================================
-
-HANDLE g_retryThread = nullptr;
-volatile bool g_stopRetryThread = false;
-
-DWORD WINAPI RetryThreadProc(LPVOID lpParam) {
-    Wh_Log(L"Retry thread started - retrying immediately every 500ms");
-
-    // NO initial delay - try immediately and every 500ms
-    for (int attempt = 1; attempt <= 60 && !g_stopRetryThread; attempt++) {
-        Wh_Log(L"Retry thread attempt %d/60", attempt);
-
-        if (!g_hTaskbarWnd) {
-            HWND hWnd = FindCurrentProcessTaskbarWindows(&g_secondaryTaskbarWindows);
-            if (hWnd) {
-                Wh_Log(L"Retry thread found taskbar: %p", hWnd);
-                HandleIdentifiedTaskbarWindow(hWnd);
-            }
-        }
-
-        // Check for InputSite if taskbar is found
-        if (g_hTaskbarWnd && !g_inputSiteProcHooked) {
-            HWND hXamlIslandWnd = FindWindowEx(
-                g_hTaskbarWnd, nullptr,
-                L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
-            if (hXamlIslandWnd) {
-                HWND hInputSiteWnd = FindWindowEx(
-                    hXamlIslandWnd, nullptr,
-                    L"Windows.UI.Input.InputSite.WindowClass", nullptr);
-                if (hInputSiteWnd) {
-                    Wh_Log(L"Retry thread found InputSite: %p", hInputSiteWnd);
-                    HandleIdentifiedInputSiteWindow(hInputSiteWnd);
-                }
-            }
-        }
-
-        // If both are hooked, we're done
-        if (g_hTaskbarWnd && g_inputSiteProcHooked) {
-            Wh_Log(L"Retry thread: all hooks installed successfully!");
-            break;
-        }
-
-        // Wait before next attempt
-        Sleep(500);
-    }
-
-    if (!g_hTaskbarWnd) {
-        Wh_Log(L"Retry thread: taskbar not found in this process after all attempts");
-    } else if (!g_inputSiteProcHooked) {
-        Wh_Log(L"Retry thread: InputSite not found (might be Windows 10)");
-    }
-
-    Wh_Log(L"Retry thread exiting");
-    return 0;
-}
-
-void StartRetryThread() {
-    g_stopRetryThread = false;
-    g_retryThread = CreateThread(nullptr, 0, RetryThreadProc, nullptr, 0, nullptr);
-    if (g_retryThread) {
-        Wh_Log(L"Started retry thread");
-    } else {
-        Wh_Log(L"Failed to start retry thread: %u", GetLastError());
-    }
-}
-
-void StopRetryThread() {
-    if (g_retryThread) {
-        g_stopRetryThread = true;
-        WaitForSingleObject(g_retryThread, 3000);
-        CloseHandle(g_retryThread);
-        g_retryThread = nullptr;
-    }
-}
-
-// ============================================================================
 // Notification Popup - Windows 11 Style
 // ============================================================================
 
@@ -407,6 +327,15 @@ const int POPUP_WIDTH = 300;
 const int POPUP_HEIGHT = 60;
 const int POPUP_CORNER_RADIUS = 12;
 const int POPUP_MARGIN = 20;
+
+// Fade animation: timer-driven so we never block the taskbar thread.
+const UINT_PTR TIMER_FADE_IN = 1;
+const UINT_PTR TIMER_HOLD = 2;
+const UINT_PTR TIMER_FADE_OUT = 3;
+const UINT FADE_TICK_MS = 16;          // ~60 fps
+const int FADE_STEP_ALPHA = 32;        // ~7 ticks (~115 ms) per fade
+const int POPUP_TARGET_ALPHA = 230;
+int g_popupAlpha = 0;
 
 // Colors (Windows 11 dark theme style)
 const COLORREF COLOR_BG = RGB(32, 32, 32);
@@ -497,14 +426,35 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
 
         case WM_TIMER:
-            KillTimer(hwnd, 1);
-            // Quick fade out
-            for (int alpha = 230; alpha >= 0; alpha -= 40) {
-                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-                Sleep(8);
+            // Three-stage fade state machine. No Sleep — keeps the
+            // taskbar thread responsive between scrolls.
+            switch (wParam) {
+                case TIMER_FADE_IN:
+                    g_popupAlpha += FADE_STEP_ALPHA;
+                    if (g_popupAlpha >= POPUP_TARGET_ALPHA) {
+                        g_popupAlpha = POPUP_TARGET_ALPHA;
+                        SetLayeredWindowAttributes(hwnd, 0, (BYTE)g_popupAlpha, LWA_ALPHA);
+                        KillTimer(hwnd, TIMER_FADE_IN);
+                        SetTimer(hwnd, TIMER_HOLD, g_settings.notificationDuration, nullptr);
+                    } else {
+                        SetLayeredWindowAttributes(hwnd, 0, (BYTE)g_popupAlpha, LWA_ALPHA);
+                    }
+                    return 0;
+                case TIMER_HOLD:
+                    KillTimer(hwnd, TIMER_HOLD);
+                    SetTimer(hwnd, TIMER_FADE_OUT, FADE_TICK_MS, nullptr);
+                    return 0;
+                case TIMER_FADE_OUT:
+                    g_popupAlpha -= FADE_STEP_ALPHA;
+                    if (g_popupAlpha <= 0) {
+                        KillTimer(hwnd, TIMER_FADE_OUT);
+                        DestroyWindow(hwnd);
+                    } else {
+                        SetLayeredWindowAttributes(hwnd, 0, (BYTE)g_popupAlpha, LWA_ALPHA);
+                    }
+                    return 0;
             }
-            DestroyWindow(hwnd);
-            return 0;
+            break;
 
         case WM_DESTROY:
             if (g_popupWnd == hwnd) {
@@ -542,20 +492,17 @@ void ShowNotification(const std::wstring& deviceName) {
 
     RegisterPopupClass();
 
+    // DestroyWindow synchronously fires WM_DESTROY which nulls g_popupWnd
+    // and cancels any active fade timer for that window.
     if (g_popupWnd) {
-        KillTimer(g_popupWnd, 1);
         DestroyWindow(g_popupWnd);
-        g_popupWnd = nullptr;
     }
 
-    // Store device name with parenthetical text stripped
     g_popupText = StripParentheses(deviceName);
+    g_popupAlpha = 0;
 
-    // Get work area (excludes taskbar)
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
-
-    // Center horizontally, position near bottom
     int x = (workArea.right - workArea.left - POPUP_WIDTH) / 2 + workArea.left;
     int y = workArea.bottom - POPUP_HEIGHT - 50;
 
@@ -567,19 +514,10 @@ void ShowNotification(const std::wstring& deviceName) {
     );
 
     if (g_popupWnd) {
-        // Set initial transparency
         SetLayeredWindowAttributes(g_popupWnd, 0, 0, LWA_ALPHA);
         ShowWindow(g_popupWnd, SW_SHOWNOACTIVATE);
         UpdateWindow(g_popupWnd);
-
-        // Quick fade in
-        for (int alpha = 0; alpha <= 230; alpha += 50) {
-            SetLayeredWindowAttributes(g_popupWnd, 0, alpha, LWA_ALPHA);
-            Sleep(5);
-        }
-        SetLayeredWindowAttributes(g_popupWnd, 0, 230, LWA_ALPHA);
-
-        SetTimer(g_popupWnd, 1, g_settings.notificationDuration, nullptr);
+        SetTimer(g_popupWnd, TIMER_FADE_IN, FADE_TICK_MS, nullptr);
         Wh_Log(L"Notification shown");
     } else {
         Wh_Log(L"Failed to create popup: %u", GetLastError());
@@ -698,41 +636,6 @@ LRESULT CALLBACK TaskbarWindowSubclassProc(
             // if that hook is active, skip this path to avoid double-firing.
             if (!g_inputSiteProcHooked && OnMouseWheel(hWnd, wParam, lParam)) {
                 return 0;  // Consume the message
-            }
-            break;
-
-        case WM_TIMER:
-            if (wParam == TIMER_FIND_INPUTSITE) {
-                g_inputSiteRetryCount++;
-                Wh_Log(L"InputSite retry attempt %d/%d", g_inputSiteRetryCount, MAX_INPUTSITE_RETRIES);
-
-                if (!g_inputSiteProcHooked && g_hTaskbarWnd) {
-                    HWND hXamlIslandWnd = FindWindowEx(
-                        g_hTaskbarWnd, nullptr,
-                        L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
-                    if (hXamlIslandWnd) {
-                        Wh_Log(L"Found DesktopWindowContentBridge: %p", hXamlIslandWnd);
-                        HWND hInputSiteWnd = FindWindowEx(
-                            hXamlIslandWnd, nullptr,
-                            L"Windows.UI.Input.InputSite.WindowClass", nullptr);
-                        if (hInputSiteWnd) {
-                            Wh_Log(L"Found InputSite: %p", hInputSiteWnd);
-                            HandleIdentifiedInputSiteWindow(hInputSiteWnd);
-                            if (g_inputSiteProcHooked) {
-                                KillTimer(hWnd, TIMER_FIND_INPUTSITE);
-                                Wh_Log(L"InputSite hooked via retry timer after %d attempts", g_inputSiteRetryCount);
-                            }
-                        }
-                    }
-                }
-
-                if (g_inputSiteProcHooked || g_inputSiteRetryCount >= MAX_INPUTSITE_RETRIES) {
-                    KillTimer(hWnd, TIMER_FIND_INPUTSITE);
-                    if (!g_inputSiteProcHooked) {
-                        Wh_Log(L"InputSite hook failed after %d retries - Windows 10 or scroll won't work", g_inputSiteRetryCount);
-                    }
-                }
-                return 0;
             }
             break;
 
@@ -1007,31 +910,20 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
-    Wh_Log(L"Wh_ModAfterInit - looking for existing taskbar windows...");
-
-    // Try to find existing taskbar windows immediately
+    // For mods that load into an already-running explorer.exe, do one
+    // synchronous EnumWindows pass. New taskbars/InputSites created later
+    // (e.g. after explorer restart, monitor change) are caught by the
+    // CreateWindowExW hook installed in Wh_ModInit.
     HWND hWnd = FindCurrentProcessTaskbarWindows(&g_secondaryTaskbarWindows);
     if (hWnd) {
         HandleIdentifiedTaskbarWindow(hWnd);
-    } else {
-        Wh_Log(L"No taskbar window found yet");
     }
-
-    // Always start retry thread - it will handle finding taskbar and InputSite
-    // even if taskbar was found, InputSite might not be ready yet
-    StartRetryThread();
-
-    Wh_Log(L"=== Ready! Hold Ctrl and scroll over the taskbar to switch audio devices ===");
 }
 
 void Wh_ModUninit() {
     Wh_Log(L"=== Audio Output Device Switcher uninitializing ===");
 
-    // Stop retry thread first
-    StopRetryThread();
-
     if (g_hTaskbarWnd) {
-        KillTimer(g_hTaskbarWnd, TIMER_FIND_INPUTSITE);
         UnsubclassTaskbarWindow(g_hTaskbarWnd);
         for (HWND hSecondaryWnd : g_secondaryTaskbarWindows) {
             UnsubclassTaskbarWindow(hSecondaryWnd);
