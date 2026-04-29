@@ -1,5 +1,5 @@
 {
-    "workbench.editor.showTabs": true,
+    "workbench.editor.showTabs": "multiple",
     "workbench.statusBar.visible": false,
     "workbench.activityBar.location": "hidden",
     "windhawk.editedModId": "audio-scroll-switcher",

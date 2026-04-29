@@ -782,6 +782,61 @@ HWND WINAPI CreateWindowExW_Hook(
     return hWnd;
 }
 
+// Win11's taskbar creates the InputSite child via the undocumented
+// CreateWindowInBand (user32) rather than CreateWindowExW. Without hooking
+// this, WM_POINTERWHEEL is never intercepted when the taskbar is created
+// after the mod loads.
+using CreateWindowInBand_t = HWND(WINAPI*)(
+    DWORD dwExStyle,
+    LPCWSTR lpClassName,
+    LPCWSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam,
+    DWORD dwBand);
+CreateWindowInBand_t CreateWindowInBand_Original;
+
+HWND WINAPI CreateWindowInBand_Hook(
+    DWORD dwExStyle,
+    LPCWSTR lpClassName,
+    LPCWSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam,
+    DWORD dwBand
+) {
+    HWND hWnd = CreateWindowInBand_Original(
+        dwExStyle, lpClassName, lpWindowName, dwStyle,
+        X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam, dwBand
+    );
+
+    if (!hWnd) return hWnd;
+
+    BOOL bTextualClassName = ((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0;
+
+    if (bTextualClassName &&
+        _wcsicmp(lpClassName, L"Windows.UI.Input.InputSite.WindowClass") == 0) {
+        Wh_Log(L"InputSite window created (in-band): %p", hWnd);
+        if (!g_inputSiteProcHooked) {
+            HandleIdentifiedInputSiteWindow(hWnd);
+        }
+    }
+
+    return hWnd;
+}
+
 // ============================================================================
 // Windhawk Mod Functions
 // ============================================================================
@@ -809,6 +864,22 @@ BOOL Wh_ModInit() {
 
     // Hook CreateWindowExW for dynamic window creation
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original);
+
+    // Hook CreateWindowInBand: Win11 taskbar uses this (not CreateWindowExW)
+    // to create its InputSite child. Without it, WM_POINTERWHEEL is missed
+    // when the taskbar appears after the mod loads.
+    HMODULE hUser32 = LoadLibraryEx(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (hUser32) {
+        auto pCreateWindowInBand =
+            (CreateWindowInBand_t)GetProcAddress(hUser32, "CreateWindowInBand");
+        if (pCreateWindowInBand) {
+            Wh_SetFunctionHook((void*)pCreateWindowInBand,
+                               (void*)CreateWindowInBand_Hook,
+                               (void**)&CreateWindowInBand_Original);
+        } else {
+            Wh_Log(L"CreateWindowInBand not found in user32.dll");
+        }
+    }
 
     Wh_Log(L"Hooks installed, waiting for taskbar...");
     return TRUE;
